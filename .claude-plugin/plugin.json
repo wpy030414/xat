@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "xat",
+  "version": "0.1.0",
+  "description": "XAT 工具箱：kill-port、upload-img、upload-repo 三个实用 skill 的合集",
+  "author": {
+    "name": "杏仁鹿",
+    "email": "krkr@xrl.im"
+  },
+  "skills": [
+    "./skills/kill-port",
+    "./skills/upload-img",
+    "./skills/upload-repo"
+  ]
+}
