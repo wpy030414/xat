@@ -1,6 +1,6 @@
 ---
 name: gictator
-description: "独裁式重写 git 提交历史：移除所有 co-author，author/committer 统一改为本人（取自 git 全局配置），提交时间对齐作者时间，并强制 GPG 签名。"
+description: "独裁式重写 git 提交历史：移除所有 co-author，author/committer 统一改为本人（取自 git 全局配置），提交时间对齐作者时间，并强制 GPG 签名。无参数时覆盖所有未 push commit（含被 amend 的，含已 push 但被 amend 的）。"
 argument-hint: "[commit_hash]"
 user-invocable: true
 ---
@@ -14,13 +14,13 @@ user-invocable: true
 3. **时间对齐**：committer date 强制等于原 author date（提交时间 = 作者时间）。
 4. **强制签名**：用 `git commit-tree -S` 重建每个 commit，强制 GPG 签名。
 
-> **实现原理**：不使用 `rebase` / `filter-branch` / `filter-repo`。逐 commit 读取其 tree 与父指针，通过 `commit-tree -S` 以新身份、新时间、新 message 重建为**全新 hash**，再沿拓扑序（parent 在前）串起父指针，最后用带 CAS 的 `update-ref` 一次性切换分支指针。tree 内容**逐字节不变**，仅元数据被改写。
+> **实现原理**：不使用 `rebase` / `filter-branch` / `filter-repo`。一次性批量读取全部 commit 元数据（1 次 `rev-list --format`，含 tree/parents/message），逐 commit 通过 `commit-tree -S` 以新身份、新时间、新 message 重建为**全新 hash**，再沿拓扑序（parent 在前）串起父指针，最后用带 CAS 的 `update-ref` 一次性切换分支指针。tree 内容**逐字节不变**，仅元数据被改写。
 
 ## 调用形态
 
 | 形态 | 语义 |
 |---|---|
-| `/gictator` | 独裁当前分支**所有未 push** 的 commit（以 upstream 跟踪分支为界）。 |
+| `/gictator` | 独裁**所有未 push** 的 commit（含被 amend 的，含已 push 但被 amend 的）。 |
 | `/gictator <commit_hash>` | 从 `<commit_hash>`（**含**）到 HEAD 的所有 commit 独裁。 |
 
 ## 参数
@@ -47,59 +47,51 @@ user-invocable: true
 脚本按以下优先级确定待重写的 commit 集合（`resolveRange()`）：
 
 ```
-① 传了 commit_hash → range 模式：git rev-list --reverse --topo-order <hash>..HEAD，再前插 <hash> 本身。
-② 未传 + 有 upstream → unpushed 模式：git rev-list --reverse --topo-order @{u}..HEAD。
-③ 未传 + 无 upstream → all 模式（回退）：重写当前分支全部 commit，并在输出中给出 warning。
+① 传了 commit_hash → range 模式：git rev-list <hash>..HEAD，再前插 <hash> 本身。
+② 未传 + 有 upstream        → 排除 @{u} 可达：git rev-list @{u}..HEAD（basis: upstream）。
+③ 未传 + 无 upstream + 有远端 → 排除所有 remote-tracking ref 可达：git rev-list HEAD --not --remotes
+                                 （basis: remotes；比盲目重写全历史安全）。
+④ 未传 + 无任何远端 ref      → 纯本地仓库，重写当前分支全部 commit（basis: all，输出 warning）。
+⑤ amend 扩展（②③④之后统一应用）：
+   扫描 HEAD reflog 中 `commit (amend)` 条目，产物 hash 若在当前 HEAD 祖先链上
+   却不在上述范围（即「已 push 但被 amend」），以拓扑最深者为锚点，
+   范围向下扩展至锚点（含），级联重写到 HEAD → amendExtended 计数。
 ```
 
+- **amend 覆盖语义**：未 push 的 amended commit 本就在范围②③内（新 hash 不可达于 upstream/远端）；已 push 后又被 amend 的由 ⑤ 捕获——重写后需 `--force-with-lease` 强推，`pushHint` 会明确提示。
 - **祖先校验**：range 模式下若 `<hash>` 不是当前 HEAD 的祖先，直接报错退出，避免误改无关分支。
 - **merge commit**：范围内的父指针会被重映射到重写后的新 hash；范围外的父保持原样。多父合并因此得以正确保留。
 - **只动当前分支**：脚本仅切换当前分支指针，其他分支（如被合并的 feature 分支）不会被移动。
 
 ## 操作步骤
 
-> 本技能为**历史重写**，属高风险但可回滚的操作。按下述流程执行，先预览后落地。
+> 本技能为历史重写，但**全程无需向用户确认**：脚本内置自动备份 ref（`refs/gictator/<branch>` 记录旧 HEAD）+ CAS 式指针更新 + reflog 兜底，任何失败分支指针都不被改动。**数据采集完直接执行，一步到位，不浪费用户时间。**
 
-### 1. 预览（dry-run，必做）
+### 1. 直接执行（唯一必做步骤）
 
 在**目标 git 仓库根目录**下执行（`<skill_dir>` 为本 SKILL.md 所在目录，用绝对路径引用脚本）：
-
-```bash
-node <skill_dir>/gictator.cjs [commit_hash] --dry-run
-```
-
-解析 stdout 的 JSON，向用户展示预览表（见「结果展示 / dry-run 预览」），并明确告知：
-
-- 模式（`range` / `unpushed` / `all`）、待重写 commit 数量、目标身份、签名密钥。
-- 若 `mode === "all"`（无 upstream 回退）：**必须停下来向用户确认**——这会重写当前分支的全部历史，通常不是「只改未 push」的本意。确认后再进入步骤 2。
-- 若 `workingTreeDirty === true`：提示用户工作树有未提交改动。重写**不影响**工作树与索引（tree 逐字节不变，`update-ref` 不做 checkout），可安全继续，但需让用户知情。
-
-### 2. 执行
-
-用户知悉（all 模式下确认）后，去掉 `--dry-run` 执行：
 
 ```bash
 node <skill_dir>/gictator.cjs [commit_hash]
 ```
 
-脚本成功后：以 CAS 方式更新当前分支指针（`git update-ref refs/heads/<branch> <newHead> <oldHead>`），返回每个 commit 的旧→新 hash 映射与签名状态。
+`--dry-run` 仅供用户主动要求预览时使用，**不是必经步骤**；也不要执行两遍（先 dry-run 再实跑）——实跑输出里已含完整的旧→新映射与每 commit 详情。
 
-失败（多为 GPG 签名不可用）时：分支指针**不被改动**，脚本返回 `error` 与 `partial:true`；据 stderr 向用户报告原因（提示检查 `user.signingkey`、私钥是否已解锁、gpg-agent 是否可用），并给出解锁建议后重试。
+### 2. 展示结果 + 善后提示
 
-### 3. 展示结果 + 善后提示
+向用户展示执行结果表（见「结果展示」），并附上输出 JSON 中的善后信息：
 
-向用户展示执行结果表，并给出两条善后命令（取自输出 JSON）：
-
-- `rollback`：`git reset --hard <oldHead>` —— 旧 commit 仍在对象库与 reflog 中，可一键回退。
-- `pushHint`：历史已重写，推送需 `git push --force-with-lease`（**不要**用 `--force`，`--force-with-lease` 在远端有他人新提交时会拒绝，更安全）。
+- `rollback`：`git reset --hard <oldHead>` —— 旧 commit 仍在对象库、reflog 与 `refs/gictator/<branch>` 备份 ref 中，可一键回退。
+- `pushHint`：历史已重写时为 `git push --force-with-lease`（**不要**用 `--force`，`--force-with-lease` 在远端有他人新提交时会拒绝，更安全）；`amendExtended > 0` 时会注明「含已 push 但被 amend 的 commit，需强推」。
+- 若 `warning` 非空（如 basis=all 回退），在结果中转述该 warning 即可，**无需停下等待确认**（该场景仅在纯本地仓库出现，无远端风险且已自动备份）。
 
 ## 执行命令（脚本 CLI 参考）
 
 ```bash
-# 未 push 模式，预览
-node <skill_dir>/gictator.cjs --dry-run
-# 未 push 模式，执行
+# 未 push 模式（含 amend 扩展），直接执行
 node <skill_dir>/gictator.cjs
+# 仅预览
+node <skill_dir>/gictator.cjs --dry-run
 # range 模式：从 abc1234（含）到 HEAD
 node <skill_dir>/gictator.cjs abc1234
 # 覆盖签名密钥
@@ -113,15 +105,15 @@ node <skill_dir>/gictator.cjs --key 0123ABCD...
 ```json
 {
   "success": true, "dryRun": true, "branch": "main",
-  "mode": "unpushed", "upstream": "origin/main",
-  "baseParent": "8637561", "count": 2,
+  "mode": "unpushed", "basis": "upstream", "upstream": "origin/main",
+  "baseParent": "8637561", "count": 2, "amendedCount": 1, "amendExtended": 0,
   "identity": "杏仁鹿 <krkr@xrl.im>", "idFromGlobal": true,
   "signingKey": "5DA29157B3C5F863", "workingTreeDirty": false,
   "warning": null,
   "preview": [
     {"old":"b4fc1ce","subject":"feat: 未push提交1","author":"另一人 <another@x.com>",
      "authorDate":"2026-10-15T09:22:11+08:00","committerDate":"2026-10-15T09:22:11+08:00",
-     "sigBefore":"N","coAuthors":1}
+     "sigBefore":"N","coAuthors":1,"amended":true}
   ]
 }
 ```
@@ -130,14 +122,16 @@ node <skill_dir>/gictator.cjs --key 0123ABCD...
 
 ```json
 {
-  "success": true, "branch": "main", "mode": "unpushed", "upstream": "origin/main",
+  "success": true, "branch": "main", "mode": "unpushed", "basis": "upstream", "upstream": "origin/main",
   "identity": "杏仁鹿 <krkr@xrl.im>", "idFromGlobal": true, "signingKey": "5DA29157B3C5F863",
   "oldHead": "3cc65fb...", "newHead": "9ab12cd...", "count": 2,
+  "amendedCount": 1, "amendExtended": 0,
   "allSigned": true, "totalCoAuthorsRemoved": 1, "workingTreeDirty": false, "warning": null,
   "results": [
     {"old":"b4fc1ce","new":"e71aa02","newFull":"e71aa02...","subject":"feat: 未push提交1",
-     "coAuthorsRemoved":1,"sigBefore":"N","sigAfter":"G"}
+     "coAuthorsRemoved":1,"sigBefore":"N","sigAfter":"G","amended":true}
   ],
+  "backupRef": "refs/gictator/main",
   "rollback": "git reset --hard 3cc65fb...",
   "pushHint": "git push --force-with-lease"
 }
@@ -146,7 +140,7 @@ node <skill_dir>/gictator.cjs --key 0123ABCD...
 **空范围**（没有可独裁的 commit）：
 
 ```json
-{"success":true,"empty":true,"branch":"main","mode":"unpushed","upstream":"origin/main",
+{"success":true,"empty":true,"branch":"main","mode":"unpushed","basis":"upstream","upstream":"origin/main",
  "message":"没有未 push 的 commit，无需独裁"}
 ```
 
@@ -156,35 +150,29 @@ node <skill_dir>/gictator.cjs --key 0123ABCD...
 {"success":false,"error":"当前处于 detached HEAD 状态，请先切换到具体分支（如 git checkout main）"}
 ```
 
+失败（多为 GPG 签名不可用）时：分支指针**不被改动**，返回 `error` 与 `partial:true`；据 stderr 报告原因（提示检查 `user.signingkey`、私钥是否已解锁、gpg-agent 是否可用）。
+
 ## 结果展示
-
-### dry-run 预览表
-
-```
-将独裁 <count> 个 commit（模式：<mode>｜身份：<identity>｜签名：<signingKey>）：
-
-| # | commit | 原 author | co-author | 签名 | subject |
-|---|---|---|---|---|---|
-| 1 | b4fc1ce | 另一人 <another@x.com> | 1 | N→G | feat: 未push提交1 |
-| 2 | 3cc65fb | 第三人 <third@x.com> | 0 | N→G | fix: 未push提交2 |
-```
-
-> `all` 模式回退时，在表格外**醒目提示**：「当前分支无 upstream，将重写全部 <count> 个历史 commit，是否确认？」并等待用户回复。
 
 ### 执行结果表
 
 ```
-独裁完成 ✅（<count> 个 commit｜移除 <totalCoAuthorsRemoved> 个 co-author｜签名 <allSigned>）：
+独裁完成 ✅（<count> 个 commit｜amended <amendedCount>｜移除 <totalCoAuthorsRemoved> 个 co-author｜签名 <allSigned>）：
 
-| commit | 新 hash | co-author 移除 | 签名 | subject |
-|---|---|---|---|---|
-| b4fc1ce | e71aa02 | 1 | N→G | feat: 未push提交1 |
-| 3cc65fb | 9ab12cd | 0 | N→G | fix: 未push提交2 |
+| commit | 新 hash | co-author 移除 | 签名 | amended | subject |
+|---|---|---|---|---|---|
+| b4fc1ce | e71aa02 | 1 | N→G | ✓ | feat: 未push提交1 |
+| 3cc65fb | 9ab12cd | 0 | N→G | | fix: 未push提交2 |
 
 - 分支指针：<oldHead7> → <newHead7>
+- 备份：refs/gictator/<branch> → <oldHead7>
 - 回退：git reset --hard <oldHead>
 - 推送：git push --force-with-lease
 ```
+
+- `amendExtended > 0` 时在表格上方注明：「范围已扩展：含 <amendExtended> 个已 push 但被 amend 的 commit，推送需强推」。
+- `basis === "all"` 时转述 warning（纯本地仓库全量重写）。
+- `empty === true` 时直接告知「没有未 push 的 commit，无需独裁」，不展示表格。
 
 ## 签名状态码（`%G?`）对照
 
@@ -199,7 +187,9 @@ node <skill_dir>/gictator.cjs --key 0123ABCD...
 
 ## 注意事项
 
-- **不可逆的是「远端」**：本地旧 commit 通过 reflog 与 `rollback` 可恢复；但若已 `--force-with-lease` 推送，远端历史即被覆盖，协作者需重新对齐。
+- **不可逆的是「远端」**：本地旧 commit 通过 reflog、备份 ref 与 `rollback` 可恢复；但若已 `--force-with-lease` 推送，远端历史即被覆盖，协作者需重新对齐。
+- **amend 扩展会重写已 push 的 commit**：这是预期行为（用户明确要求被 amend 的也要独裁）；`pushHint` 会提示强推。
 - **只重写当前分支**：merge 引入的其他分支引用不会被移动，重写后这些分支可能与当前分支指向不同历史——这是预期行为。
-- **时间对齐会丢弃原 committer date**：所有被重写 commit 的提交时间改为其作者时间，rebase/cherry-pick 产生的「提交晚于作者」痕迹被抹平。
+- **时间对齐会丢弃原 committer date**：所有被重写 commit 的提交时间改为其作者时间，rebase/cherry-pick/amend 产生的「提交晚于作者」痕迹被抹平。
 - **工作树安全**：重写只改元数据与分支指针，不触碰工作树与索引；脏工作树不会丢失改动。
+- **性能**：元数据批量读取（1 次 `rev-list --format`），每 commit 仅 1 次 `commit-tree -S`；耗时大头为 GPG 签名本身（约 0.2~0.3s/commit），子进程数已压缩到极限。
