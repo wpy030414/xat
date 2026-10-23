@@ -31,7 +31,7 @@ user-invocable: true
 
 ## 工具约束
 
-- 所有 git 操作通过技能目录下的 `gictator.cjs`（Node.js）完成；脚本内部一律使用 `execFileSync('git', [args])` **数组传参**，规避 shell 引号与转义问题。
+- 所有 git 操作通过技能目录下的 `scripts/index.cjs`（Node.js）完成；脚本内部一律使用 `execFileSync('git', [args])` **数组传参**，规避 shell 引号与转义问题。
 - 唯一的 shell 命令应只有 `node`；不要手写 `git rebase`、`git filter-branch` 等替代实现。
 - commit message 通过 `stdin` 传入 `commit-tree`（`input` 选项），**禁止**内联到命令行字符串。
 
@@ -72,7 +72,7 @@ user-invocable: true
 在**目标 git 仓库根目录**下执行（`<skill_dir>` 为本 SKILL.md 所在目录，用绝对路径引用脚本）：
 
 ```bash
-node <skill_dir>/gictator.cjs [commit_hash]
+node <skill_dir>/scripts/index.cjs [commit_hash]
 ```
 
 `--dry-run` 仅供用户主动要求预览时使用，**不是必经步骤**；也不要执行两遍（先 dry-run 再实跑）——实跑输出里已含完整的旧→新映射与每 commit 详情。
@@ -89,13 +89,13 @@ node <skill_dir>/gictator.cjs [commit_hash]
 
 ```bash
 # 未 push 模式（含 amend 扩展），直接执行
-node <skill_dir>/gictator.cjs
+node <skill_dir>/scripts/index.cjs
 # 仅预览
-node <skill_dir>/gictator.cjs --dry-run
+node <skill_dir>/scripts/index.cjs --dry-run
 # range 模式：从 abc1234（含）到 HEAD
-node <skill_dir>/gictator.cjs abc1234
+node <skill_dir>/scripts/index.cjs abc1234
 # 覆盖签名密钥
-node <skill_dir>/gictator.cjs --key 0123ABCD...
+node <skill_dir>/scripts/index.cjs --key 0123ABCD...
 ```
 
 ## 输出 JSON 结构

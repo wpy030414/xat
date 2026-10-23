@@ -9,11 +9,11 @@
  *   3. committer date 强制等于原 author date（提交时间 = 作者时间）；
  *   4. 用 commit-tree -S 强制 GPG 签名重建。
  *
- * 用法：
- *   node gictator.cjs                    # 独裁所有「未 push」的 commit（含被 amend 的，含已 push 但被 amend 的）
- *   node gictator.cjs <commit_hash>      # 从 <commit_hash>（含）到 HEAD 全部独裁
- *   node gictator.cjs [commit_hash] --dry-run   # 仅预览，不改动
- *   node gictator.cjs [commit_hash] --key <keyid>  # 覆盖签名密钥
+ * 用法（在目标仓库根目录执行）：
+ *   node scripts/index.cjs                    # 独裁所有「未 push」的 commit（含被 amend 的，含已 push 但被 amend 的）
+ *   node scripts/index.cjs <commit_hash>      # 从 <commit_hash>（含）到 HEAD 全部独裁
+ *   node scripts/index.cjs [commit_hash] --dry-run   # 仅预览，不改动
+ *   node scripts/index.cjs [commit_hash] --key <keyid>  # 覆盖签名密钥
  *
  * 范围界定（未携带参数时）：
  *   ① 有 upstream        → @{u}..HEAD（upstream 可达的全部排除）；
