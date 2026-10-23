@@ -271,9 +271,15 @@ function hasSshpass() {
   return !r.code || r.code === 1; // sshpass -V 在老版本上退出码不稳定，能跑起来就算有
 }
 
-function sshArgv(t, usePass, extra) {
+/**
+ * 拼 ssh 的 argv。顺序是硬约束：SSH 选项必须在主机名之前，远程命令必须在主机名之后 ——
+ * ssh 把主机名之后的第一个位置参数当作远程命令；一旦颠倒，它会拿 `bash -s` 去解析主机名，
+ * 直接报 `hostname contains invalid characters`。
+ */
+function sshArgv(t, usePass, spec) {
+  const s = spec || {};
   const base = usePass ? ['sshpass', '-e', 'ssh'] : ['ssh'];
-  return [...base, ...SSH_OPTS, ...(extra || []), t.text];
+  return [...base, ...SSH_OPTS, ...(s.options || []), t.text, ...(s.command || [])];
 }
 
 function scpArgv(t, usePass) {
@@ -284,7 +290,7 @@ function scpArgv(t, usePass) {
 /** 远端执行：脚本走 stdin（bash -s），彻底绕开「双引号里再套单引号」这个老坑。 */
 function remote(t, ctx, script, opts) {
   const o = opts || {};
-  const argv = sshArgv(t, ctx.usePass, ['bash -s']);
+  const argv = sshArgv(t, ctx.usePass, { command: ['bash -s'] });
   return exec(argv[0], argv.slice(1), {
     input: script,
     timeout: o.timeout || T.probe,
@@ -294,7 +300,7 @@ function remote(t, ctx, script, opts) {
 
 function remoteAsync(t, ctx, script, opts) {
   const o = opts || {};
-  const argv = sshArgv(t, ctx.usePass, ['bash -s']);
+  const argv = sshArgv(t, ctx.usePass, { command: ['bash -s'] });
   return execAsync(argv[0], argv.slice(1), {
     input: script,
     timeout: o.timeout || T.deploy,
@@ -332,7 +338,7 @@ function classifySshFailure(stderr) {
 function connect(t, password, log) {
   const ctx = { password, usePass: false };
 
-  const keyArgv = sshArgv(t, false, ['-o', 'BatchMode=yes']);
+  const keyArgv = sshArgv(t, false, { options: ['-o', 'BatchMode=yes'] });
   const keyTry = exec(keyArgv[0], keyArgv.slice(1), {
     input: 'echo SSH_OK\necho "##HOME=$HOME"\n',
     timeout: T.probe,
@@ -459,7 +465,8 @@ function upload(t, ctx, bundle, log) {
     env: ctx.usePass ? { SSHPASS: ctx.password } : {},
   });
   if (!r.ok) {
-    return { error: { code: 'UPLOAD_FAILED', message: 'scp 上传 bundle 失败', detail: tail(r.stderr, 6) } };
+    // dest 一并交回：scp 中途失败可能在远端留下半成品，调用方要靠它清理。
+    return { dest, error: { code: 'UPLOAD_FAILED', message: 'scp 上传 bundle 失败', detail: tail(r.stderr, 6) } };
   }
   log.push(`bundle 已上传到 ${dest}`);
   return { dest };
@@ -515,7 +522,9 @@ function classifyRemote(p) {
   if (!p.exists) return { kind: 'absent' };
   if (!p.isGit) return p.empty ? { kind: 'empty-dir' } : { kind: 'occupied' };
   if (p.bare === 'true') return { kind: 'bare' };
-  if ((p.dirty || []).length) return { kind: 'dirty', dirty: p.dirty };
+  // dirty 与 repo 两条分支都会走到「命中已有仓库（分支 X）」的日志；
+  // 这里漏带 branch，dirty 时就会显示「未知」，让人误判成远程分支没读到。
+  if ((p.dirty || []).length) return { kind: 'dirty', dirty: p.dirty, branch: p.branch };
   return { kind: 'repo', branch: p.branch };
 }
 
@@ -819,36 +828,34 @@ async function deploy(opts) {
 
   /* 4. 上传 */
   const up = upload(t, ctx, bundle, log);
-  if (up.error) {
-    if (!opts.keep) safeUnlink(bundle.file);
-    return fail(up.error, { log });
-  }
+  if (up.error) return failCleanup(up.error, opts, bundle, log, t, ctx, up.dest);
 
   const defaultPath = `${home}/.xat-deploy/${ctx.repoName}`;
   const resolved = resolvePath(opts.dir, home, defaultPath);
 
   /* 5. 定位目标目录（扫描 / 决策） */
   const decision = locateTarget(t, ctx, opts, resolved, log);
-  if (decision.error) return failCleanup(decision.error, opts, bundle, log);
-  if (decision.needsInput) return needsInput(decision, opts, log);
+  if (decision.error) return failCleanup(decision.error, opts, bundle, log, t, ctx, up.dest);
+  // needs_input 同样是终局（进程就此退出），此前直接 return 绕过清理，本地与远程各留下 2.5MB。
+  // 重跑时会重新生成并上传，所以清掉不损失任何东西。
+  if (decision.needsInput) {
+    cleanupBundles(t, ctx, opts, bundle, up.dest, log);
+    return needsInput(decision, opts, log);
+  }
 
   /* 6. 部署 */
-  const deployed = applyDeploy(t, ctx, decision, bundle.dest, log);
-  if (deployed.error) return failCleanup(deployed.error, opts, bundle, log);
+  const deployed = applyDeploy(t, ctx, decision, up.dest, log);
+  if (deployed.error) return failCleanup(deployed.error, opts, bundle, log, t, ctx, up.dest);
 
   /* 7. CI/CD */
-  let ci = { files: [], note: '无工作流配置' };
+  // --skip-ci 时不能说「无工作流配置」：配置可能在、只是被跳过了，说错会让人以为漏配。
+  let ci = { files: [], note: '已跳过（--skip-ci）' };
   if (!opts.skipCi) {
     ci = await runWorkflows(t, ctx, decision.path, ctx.repoName, log);
   }
 
   /* 8. 清理 */
-  if (!opts.keep) {
-    safeUnlink(bundle.file);
-    const rm = remote(t, ctx, `rm -f ${shq(bundle.dest)} && echo CLEANED\n`);
-    if (rm.stdout.includes('CLEANED')) log.push('已清理本地与远程 bundle');
-    else log.push('清理远程 bundle 失败（非致命）');
-  }
+  cleanupBundles(t, ctx, opts, bundle, up.dest, log);
 
   /* 9. 汇总 */
   const summary = {
@@ -863,19 +870,25 @@ async function deploy(opts) {
     ci: ciSummary(ci),
   };
 
-  return {
-    status: 'ok',
-    summary,
-    table: summaryTable(summary),
-    log,
-    ci: {
-      files: ci.files,
-      note: ci.note,
-      // 只要有一个工作流失败，就单独抬到顶层：这是需要人马上看一眼的信号，
-      // 混在 files 里容易被一句「部署成功」盖过去。
-      failed: ci.files.filter((f) => !f.ok).map((f) => f.file),
+  // 必须走 finish()：deploy() 的其余出口（fail / failCleanup / needsInput / dryRun）
+  // 都在内部调用它，唯独这条成功路径裸 return —— main() 又不打印返回值，
+  // 结果就是「部署成功但 stdout 一个字节都没有」，调用方无从判断成败。
+  return finish(
+    {
+      status: 'ok',
+      summary,
+      table: summaryTable(summary),
+      log,
+      ci: {
+        files: ci.files,
+        note: ci.note,
+        // 只要有一个工作流失败，就单独抬到顶层：这是需要人马上看一眼的信号，
+        // 混在 files 里容易被一句「部署成功」盖过去。
+        failed: ci.files.filter((f) => !f.ok).map((f) => f.file),
+      },
     },
-  };
+    EXIT.ok,
+  );
 }
 
 /**
@@ -1015,12 +1028,20 @@ function decideForPath(t, ctx, opts, target, log, strategy) {
 
   if (v.kind === 'dirty') {
     const policy = opts.dirty || 'ask';
+    // porcelain 里 '??' 开头的是未跟踪文件：reset --hard 根本不删它们，而本脚本也只有
+    // reset --hard、没有 git clean。笼统说「会全部丢弃」是错的 —— 既让人白紧张，
+    // 也可能诱使人无脑 overwrite，真把已跟踪的手工热修静默毁掉。
+    const tracked = v.dirty.filter((d) => !/^\?\?/.test(d));
+    const untracked = v.dirty.filter((d) => /^\?\?/.test(d));
+    const split = `${tracked.length} 个已跟踪改动会被覆盖，${untracked.length} 个未跟踪文件不受影响`;
     if (policy === 'abort') {
       return {
         error: {
           code: 'REMOTE_DIRTY',
-          message: `${target} 有 ${v.dirty.length} 个未提交改动`,
-          hint: '按 --dirty abort 中止；确认可覆盖则加 --dirty overwrite',
+          message: `${target} 有 ${v.dirty.length} 个未提交改动（${split}）`,
+          hint: tracked.length
+            ? '已按 --dirty abort 中止，未做任何修改。确认要覆盖这些已跟踪改动，改用 --dirty overwrite'
+            : '已按 --dirty abort 中止，未做任何修改。这些改动全是未跟踪文件，reset --hard 本不会删除，可改用 --dirty overwrite 继续部署',
           detail: v.dirty.slice(0, 10),
         },
       };
@@ -1030,10 +1051,16 @@ function decideForPath(t, ctx, opts, target, log, strategy) {
         needsInput: {
           code: 'REMOTE_DIRTY',
           question:
-            `${target} 有 ${v.dirty.length} 个未提交改动，git reset --hard 会全部丢弃。继续吗？`,
+            `${target} 有 ${v.dirty.length} 个未提交改动（${split}）。` +
+            'git reset --hard 只覆盖已跟踪改动，不会删未跟踪文件。继续吗？',
           candidates: [{ path: target, dirty: v.dirty.slice(0, 20) }],
           options: [
-            { label: '覆盖（丢弃远程改动）', flag: ['--dirty', 'overwrite'] },
+            {
+              label: tracked.length
+                ? `覆盖（丢弃 ${tracked.length} 个已跟踪改动）`
+                : '继续（未跟踪文件不会被删）',
+              flag: ['--dirty', 'overwrite'],
+            },
             { label: '中止', flag: ['--dirty', 'abort'] },
           ],
         },
@@ -1084,8 +1111,21 @@ function scanByOrigin(t, ctx, originUrl) {
 /**
  * 落盘脚本。抽成纯函数是为了能被断言：这是整个工具里唯一一段「远程 bash」，
  * 缩进/引号/`set -e` 少一个都可能变成「看起来跑过了其实没换代码」。
+ *
+ * 三个入参都会直接进远程 shell，缺一个就会退化成 `git fetch 'undefined'` 这类
+ * 误导性报错（提示的是「仓库不存在/权限/磁盘满」），把人引向完全错误的排查方向
+ * ——所以在源头断言，让它立刻炸响。
  */
 function deployScript(mode, remotePath, branch, bundleDest) {
+  if (typeof remotePath !== 'string' || !remotePath.trim()) {
+    throw new TypeError('deployScript: remotePath 必须是非空字符串');
+  }
+  if (typeof bundleDest !== 'string' || !bundleDest.trim()) {
+    throw new TypeError('deployScript: bundleDest 必须是非空字符串（upload() 的返回值未正确传递？）');
+  }
+  if (typeof branch !== 'string' || !branch.trim()) {
+    throw new TypeError('deployScript: branch 必须是非空字符串');
+  }
   const p = shq(remotePath);
   const b = shq(bundleDest);
 
@@ -1104,7 +1144,14 @@ function deployScript(mode, remotePath, branch, bundleDest) {
   return (
     `set -e\n` +
     `cd ${p}\n` +
+    `before=$(git rev-parse HEAD 2>/dev/null || echo NONE)\n` +
     `git fetch ${b} ${shq(branch)}\n` +
+    // "Already up to date" 是 pull/merge 的措辞，git fetch 从不输出它 —— 旧实现拿它
+    // 判断是否真有更新属于死代码，报告于是永远说「已更新」（哪怕一个 commit 都没动）。
+    // 改用 rev-list 直接数 HEAD..FETCH_HEAD 之间的提交数，才是可靠判据；数不出来就标 UNKNOWN，
+    // 宁可显示「未知」也不要谎报。
+    `new=$(git rev-list --count "$before..FETCH_HEAD" 2>/dev/null || echo UNKNOWN)\n` +
+    `echo "##NEW=$new"\n` +
     `git reset --hard FETCH_HEAD\n` +
     `echo "##DEPLOYED=update"\n`
   );
@@ -1124,11 +1171,22 @@ function applyDeploy(t, ctx, decision, bundleDest, log) {
     };
   }
 
-  const action = marker(r.stdout, 'DEPLOYED') === 'clone' ? '新建仓库' : '已更新';
-  const uptodate = /Already up to date/i.test(r.stdout + r.stderr);
-  log.push(uptodate ? '远端已是最新提交' : `已${action === '新建仓库' ? '克隆' : '更新'}到 ${decision.path}`);
+  const isClone = marker(r.stdout, 'DEPLOYED') === 'clone';
+  // clone 没有「之前」，不参与「是否已是最新」的判断。非纯数字（含 UNKNOWN）一律不当 0 ——
+  // 把「数不出来」误当成「没有新提交」，就会在真实有更新时谎报「已是最新」。
+  const rawNew = marker(r.stdout, 'NEW');
+  const newCommits = isClone ? null : /^\d+$/.test(rawNew) ? Number(rawNew) : null;
+  const uptodate = newCommits === 0;
+  const action = isClone ? '新建仓库' : uptodate ? '已是最新' : '已更新';
+  log.push(
+    isClone
+      ? `已克隆到 ${decision.path}`
+      : uptodate
+        ? `远端已是最新提交（${decision.path}）`
+        : `已更新到 ${decision.path}（新增 ${newCommits === null ? '未知' : newCommits} 个提交）`,
+  );
 
-  return { action: uptodate ? '已是最新' : action, detail: tail(r.stdout, 6) };
+  return { action, newCommits, detail: tail(r.stdout, 6) };
 }
 
 /* ───────────────────────── CI/CD ───────────────────────── */
@@ -1437,8 +1495,30 @@ function fail(error, extra) {
   return finish({ status: 'error', error, ...(extra || {}) }, EXIT.fail);
 }
 
-function failCleanup(error, opts, bundle, log) {
-  if (!opts.keep) safeUnlink(bundle.file);
+/**
+ * 清 bundle。本地与远程必须一起清：此前 needs_input / abort 两条出口只删本地，
+ * 远程那 2.5MB 就一直留着（路径固定所以不累积，但每次部署后都占着）。
+ * remoteDest 为空表示还没上传成功，只清本地即可。
+ */
+function cleanupBundles(t, ctx, opts, bundle, remoteDest, log) {
+  if (opts.keep) {
+    if (log) log.push('已保留本地与远程 bundle（--keep）');
+    return { kept: true, remote: false };
+  }
+  if (bundle && bundle.file) safeUnlink(bundle.file);
+  if (!remoteDest || !t || !ctx) return { kept: false, remote: false };
+  const rm = remote(t, ctx, `rm -f ${shq(remoteDest)} && echo CLEANED\n`);
+  const cleaned = rm.stdout.includes('CLEANED');
+  if (log) {
+    log.push(
+      cleaned ? '已清理本地与远程 bundle' : '本地 bundle 已清理，远程清理失败（非致命）',
+    );
+  }
+  return { kept: false, remote: cleaned };
+}
+
+function failCleanup(error, opts, bundle, log, t, ctx, remoteDest) {
+  cleanupBundles(t, ctx, opts, bundle, remoteDest, log);
   return fail(error, { log });
 }
 
